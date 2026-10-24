@@ -1,180 +1,337 @@
-import math
-import numpy as np
-from collections import Counter
-from scipy.optimize import curve_fit
-import warnings
+"""
+Sequence Novelty Classifier
 
+Implementation of Algorithm 1 (Section 5.2) of
+"Structural equivalence and novelty in constrained tiling sequences."
+
+    Input : sequence prefix a_0, ..., a_N  (15 to 30 terms)
+    Output: "NO"  -> reducible to a known structural class
+            "YES" -> no reduction detected (candidate novel, not a proof of novelty)
+
+Each step below corresponds to the step of the same number in the paper.
+Sequence terms are kept as exact Python integers, so large terms do not overflow.
 """
-Data Availability:
-This code is provided as part of the manuscript's supplementary materials.
-"""
+
+import math
+from collections import Counter
+from fractions import Fraction
+from itertools import product
+
+import numpy as np
+
+
+def binom(n, k):
+    """Binomial coefficient, defined as 0 outside 0 <= k <= n."""
+    if k < 0 or n < 0 or k > n:
+        return 0
+    return math.comb(n, k)
+
 
 class SequenceNoveltyClassifier:
     """
-    Implements a multi-step pipeline to classify integer sequences based on 
-    structural novelty vs. known mathematical recurrence patterns.
+    Parameters
+    ----------
+    sequence : list[int]
+        Prefix a_0, ..., a_N of the sequence (15 to 30 terms).
+    rule_features : set[str], optional
+        Features of the sequence's generative rule, examined in Step 5:
+        "nonlinear", "arithmetic", "nonlocal". A list of numbers cannot
+        reveal how it was generated, so these are supplied with the sequence.
     """
-    def __init__(self, sequence):
-        self.raw_sequence = sequence
-        self.seq = list(sequence)
-        
+
+    SHIFT_RANGE = 5        # Step 1: index shifts n -> n + k, k in [-5, 5]
+    MAX_ORDER = 3          # Step 3: bounded recurrence order d
+    MAX_DEGREE = 2         # Step 3: bounded degree of the coefficient polynomials
+    R2_SMOOTH = 0.9999     # Step 4: threshold for a smooth exponential fit
+
+    def __init__(self, sequence, rule_features=None):
+        self.raw = [int(x) for x in sequence]
+        self.rule_features = set(rule_features or [])
+        self.trace = []
+
+    # ------------------------------------------------------------------
+    # Step 1: Normalization
+    # ------------------------------------------------------------------
     def step1_normalize(self):
-        """
-        NORMALIZATION PROCEDURE:
-        Removes leading zeros, reduces by GCD, and performs entropy-based 
-        prefix trimming to isolate the core generating sequence.
-        """
-        seq = list(self.raw_sequence)
-        
-        # Remove leading zeros
-        while len(seq) > 0 and seq[0] == 0:
-            seq = seq[1:]
-            
-        if len(seq) < 5:
-            self.seq = seq
-            return
-            
-        # Divide by Greatest Common Divisor (GCD)
-        gcd_val = seq[0]
-        for val in seq[1:]:
-            gcd_val = math.gcd(gcd_val, val)
-        if gcd_val > 1:
-            seq = [x // gcd_val for x in seq]
-            
-        best_seq = seq
-        min_entropy = float('inf')
-        
-        # Entropy-based trimming to find the most 'stable' start point
-        for k in range(min(6, len(seq) - 3)):
-            shifted_seq = seq[k:]
-            diffs = np.diff(shifted_seq)
-            counts = Counter(diffs)
-            total = len(diffs)
-            # Shannon entropy calculation
-            entropy = -sum((c / total) * math.log2(c / total) for c in counts.values())
-            
-            if entropy < min_entropy:
-                min_entropy = entropy
-                best_seq = shifted_seq
-                
+        """Strip leading zeros, divide out gcd(a_0, ..., a_N), test index
+        shifts n -> n + k for k in [-5, 5], and select the normalization that
+        minimizes the entropy of the finite differences."""
+        g = 0
+        for x in self.raw:
+            g = math.gcd(g, abs(x))
+        g = g or 1
+        self.scaled = [x // g for x in self.raw]          # gcd removed, original indexing
+
+        seq = list(self.scaled)
+        lead = 0
+        while seq and seq[0] == 0:                        # strip leading zeros
+            seq.pop(0)
+            lead += 1
+
+        def entropy(s):
+            d = [b - a for a, b in zip(s, s[1:])]
+            if not d:
+                return 0.0
+            c = Counter(d)
+            return -sum((v / len(d)) * math.log2(v / len(d)) for v in c.values())
+
+        best_k, best_seq, best_h = 0, seq, entropy(seq)
+        for k in range(-self.SHIFT_RANGE, self.SHIFT_RANGE + 1):
+            # k > 0 drops the first k terms; k <= 0 only relabels the index,
+            # which leaves the finite differences (and their entropy) unchanged.
+            s = seq[k:] if k > 0 else seq
+            if len(s) < 8:
+                continue
+            h = entropy(s)
+            if h < best_h - 1e-12:
+                best_k, best_seq, best_h = k, s, h
         self.seq = best_seq
+        self.trace.append(f"Step 1: stripped {lead} leading zero(s), gcd = {g}, shift k = {best_k}")
+
+    # ------------------------------------------------------------------
+    # Step 2: Detection of closed-form binomial structure
+    # ------------------------------------------------------------------
+    # Candidate binomial families a_n = sum_k f(n,k) g(n,k), where
+    #   f(n,k) = C(A1*n + B1*k + C1, D1*k + E1)
+    #   g(n,k) = C(A2*n + B2*k + C2, D2*k + E2)   (or g = 1)
+    # with small integer parameters.
+    _GRID = list(product((0, 1, 2), (-3, -2, -1, 0, 1, 2), (-1, 0, 1), (1, 2), (-1, 0)))
+
+    @staticmethod
+    def _family_value(f, g, n):
+        a1, b1, c1, d1, e1 = f
+        total = 0
+        for k in range(n + 2):
+            t = binom(a1 * n + b1 * k + c1, d1 * k + e1)
+            if t and g is not None:
+                a2, b2, c2, d2, e2 = g
+                t *= binom(a2 * n + b2 * k + c2, d2 * k + e2)
+            total += t
+        return total
+
+    @staticmethod
+    def _log_least_squares(target, values):
+        """Least-squares error between log|target| and log|values|."""
+        pts = [(math.log(abs(a)), math.log(abs(b))) for a, b in zip(target, values) if a and b]
+        if len(pts) < 3:
+            return float("inf")
+        return sum((x - y) ** 2 for x, y in pts) / len(pts)
 
     def step2_binomial_structure(self):
-        """
-        RECURRENCE DETECTION (Polynomial):
-        Detects if the sequence can be reduced to zero via repeated 
-        differencing (characteristic of binomial/polynomial growth).
-        """
-        if len(self.seq) < 5:
+        """Fit candidate binomial families on a logarithmic scale (least squares),
+        under the index shifts of Step 1, then verify exact agreement for all
+        n <= N. An exact match returns True (-> NO)."""
+        target = self.scaled
+        N = len(target)
+        if N < 8:
             return False
-        current_diffs = self.seq
-        for _ in range(5):
-            current_diffs = np.diff(current_diffs)
-            if len(current_diffs) == 0: break
-            if all(d == 0 for d in current_diffs):
+        shifts = range(-self.SHIFT_RANGE, self.SHIFT_RANGE + 1)
+        head = 6   # candidates must agree exactly on the first terms before fitting
+
+        survivors = []
+        for f in self._GRID:
+            for g in [None] + self._GRID:
+                cache = {}
+                def val(n):
+                    if n not in cache:
+                        cache[n] = self._family_value(f, g, n)
+                    return cache[n]
+                for t in shifts:
+                    idx = [i for i in range(N) if i + t >= 0][:head]
+                    if len(idx) == head and all(val(i + t) == target[i] for i in idx):
+                        survivors.append((f, g, t))
+
+        def aligned(c):
+            f, g, t = c
+            idx = [i for i in range(N) if i + t >= 0]
+            return [target[i] for i in idx], [self._family_value(f, g, i + t) for i in idx]
+
+        survivors.sort(key=lambda c: self._log_least_squares(*aligned(c)))
+        for c in survivors:
+            tgt, vals = aligned(c)
+            if len(tgt) >= 8 and tgt == vals:                 # exact agreement for all n <= N
+                self.trace.append(f"Step 2: exact match with f={c[0]}, g={c[1]}, shift {c[2]}")
                 return True
         return False
 
-    def step3_linear_recurrence(self):
-        """
-        RECURRENCE DETECTION (Linear):
-        Implements the Berlekamp-Massey algorithm to find the minimal 
-        polynomial of the sequence. Returns True if a short recurrence exists.
-        """
+    # ------------------------------------------------------------------
+    # Step 3: Detection of linear recurrence (D-finite test)
+    # ------------------------------------------------------------------
+    def _check_terms(self):
+        """Number of terms reserved for verification beyond those that
+        determine a recurrence (guards against coincidental fits)."""
+        return max(3, len(self.seq) // 4)
+
+    def _berlekamp_massey(self):
+        """Exact Berlekamp-Massey over the rationals; returns (L, C) with
+        a_n + C[1] a_{n-1} + ... + C[L] a_{n-L} = 0."""
+        s = [Fraction(x) for x in self.seq]
+        C, B = [Fraction(1)], [Fraction(1)]
+        L, m, b = 0, 1, Fraction(1)
+        for n in range(len(s)):
+            d = s[n] + sum(C[i] * s[n - i] for i in range(1, L + 1))
+            if d == 0:
+                m += 1
+                continue
+            T = C[:]
+            C = C + [Fraction(0)] * max(0, len(B) + m - len(C))
+            for i, x in enumerate(B):
+                C[i + m] -= (d / b) * x
+            if 2 * L <= n:
+                L, B, b, m = n + 1 - L, T, d, 1
+            else:
+                m += 1
+        return L, C
+
+    def _constant_coefficients(self):
         s = self.seq
-        n = len(s)
-        b = [1] + [0] * (n - 1)
-        c = [1] + [0] * (n - 1)
-        L = 0
-        m = -1
-        
-        for i in range(n):
-            d = s[i] + sum(c[j] * s[i - j] for j in range(1, L + 1))
-            if d != 0:
-                temp = c[:] 
-                for j in range(n - i + m):
-                    if i - m + j < n:
-                        c[i - m + j] = c[i - m + j] - d * b[j]
-                if 2 * L <= i:
-                    L = i + 1 - L
-                    m = i
-                    b = [x / d for x in temp]
-        
-        # A sequence is 'known' if the recurrence length L is less than half the length
-        return L > 0 and L <= n // 2
-
-    def step4_growth_rate(self):
-        """
-        MODEL FITTING DETAILS:
-        Fits the sequence to an exponential growth model: a(n) ~ c * lambda^n * n^alpha.
-        Uses R-squared threshold to determine if the sequence fits known growth types.
-        """
-        if len(self.seq) < 10 or any(x <= 0 for x in self.seq):
+        L, C = self._berlekamp_massey()
+        if L == 0 or 2 * L + self._check_terms() > len(s):
             return False
-            
-        y_data = np.log(self.seq)
-        x_data = np.arange(1, len(self.seq) + 1)
-        
-        def growth_model(n, log_lambda, alpha, C):
-            return n * log_lambda + alpha * np.log(n) + C
-            
-        try:
-            warnings.simplefilter('ignore')
-            # Non-linear least squares fit
-            popt, _ = curve_fit(growth_model, x_data, y_data, p0=[1.0, 0.0, 1.0])
-            residuals = y_data - growth_model(x_data, *popt)
-            ss_res = np.sum(residuals**2)
-            ss_tot = np.sum((y_data - np.mean(y_data))**2)
-            r_squared = 1 - (ss_res / ss_tot)
-            return r_squared > 0.999 # Strict threshold for mathematical sequences
-        except:
-            return False
-
-    def step5_structural_flags(self):
-        """
-        Checks for sparse or highly irregular structures that suggest 
-        novelty (e.g., high zero-density or irregular ratios).
-        """
-        zero_count = sum(1 for x in self.seq if x == 0)
-        if zero_count > len(self.seq) * 0.3:
+        if all(s[n] + sum(C[i] * s[n - i] for i in range(1, L + 1)) == 0 for n in range(L, len(s))):
+            self.trace.append(f"Step 3: constant-coefficient recurrence of order {L}")
             return True
-            
-        if len(self.seq) > 3:
-            ratios = [self.seq[i]/self.seq[i-1] for i in range(1, len(self.seq)) if self.seq[i-1] != 0]
-            if len(ratios) > 1:
-                return np.std(ratios) > np.mean(ratios)
         return False
 
-    def classify(self):
-        """
-        Main execution pipeline. Returns 'YES' for novel, 'NO' for known.
-        """
-        self.step1_normalize()
-        if not self.seq: return "YES"
-        
-        # If any known recurrence or growth model fits, it is not 'novel'
-        if self.step2_binomial_structure(): return "NO"
-        if self.step3_linear_recurrence(): return "NO"
-        if self.step4_growth_rate(): return "NO"
-        
-        # Otherwise, check for structural indicators of novelty
-        return "YES" if self.step5_structural_flags() else "YES"
+    def _polynomial_coefficients(self):
+        """Regression for p_0(n) a_n = sum_{k=1..d} p_k(n) a_{n-k}, with
+        polynomials p_k of bounded degree, followed by exact symbolic
+        verification of the recovered integer coefficients."""
+        s = self.seq
+        N = len(s)
+        for d in range(1, self.MAX_ORDER + 1):
+            for deg in range(0, self.MAX_DEGREE + 1):
+                unknowns = (d + 1) * (deg + 1)
+                if (N - d) < unknowns + self._check_terms():
+                    continue
+                # regression: least-squares null vector of the (row-normalized) system
+                rows = []
+                for n in range(d, N):
+                    ints = [n ** j * s[n - i] for i in range(d + 1) for j in range(deg + 1)]
+                    big = max(abs(x) for x in ints) or 1          # scale exactly before
+                    r = [float(Fraction(x, big)) for x in ints]   # converting (no overflow)
+                    nrm = math.sqrt(sum(x * x for x in r)) or 1.0
+                    rows.append([x / nrm for x in r])
+                _, sv, vt = np.linalg.svd(np.array(rows))
+                v = vt[-1]
+                if sv[-1] > 1e-8 * sv[0]:
+                    continue
+                v = v / v[np.argmax(np.abs(v))]
+                coef = [Fraction(float(x)).limit_denominator(1000) for x in v]
+                if all(c == 0 for c in coef[: deg + 1]):         # p_0 must not vanish
+                    continue
+                # symbolic (exact) verification on every term
+                if all(sum(coef[i * (deg + 1) + j] * n ** j * s[n - i]
+                           for i in range(d + 1) for j in range(deg + 1)) == 0
+                       for n in range(d, N)):
+                    self.trace.append(f"Step 3: polynomial-coefficient recurrence, order {d}, degree {deg}")
+                    return True
+        return False
 
-# === Ready-to-Run Entry Point ===
+    def step3_linear_recurrence(self):
+        """Berlekamp-Massey for constant coefficients, then polynomial
+        coefficients by regression with symbolic verification."""
+        if len(self.seq) < 8:
+            return False
+        return self._constant_coefficients() or self._polynomial_coefficients()
+
+    # ------------------------------------------------------------------
+    # Step 4: Growth rate estimation
+    # ------------------------------------------------------------------
+    def step4_growth_rate(self):
+        """Fit log a_n ~ n log(lambda) + alpha log n (+ constant) by least squares.
+        Returns True for a smooth exponential or polynomial-damped exponential fit."""
+        pts = [(n, math.log(abs(x))) for n, x in enumerate(self.seq, start=1) if x != 0]
+        if len(pts) < 10 or len(pts) < 0.8 * len(self.seq):
+            return False                                     # too sparse to call smooth
+        n = np.array([p[0] for p in pts], dtype=float)
+        y = np.array([p[1] for p in pts], dtype=float)
+        X = np.column_stack([n, np.log(n), np.ones_like(n)])
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        ss_tot = float(np.sum((y - y.mean()) ** 2))
+        r2 = 1.0 if ss_tot == 0 else 1 - float(np.sum((y - X @ coef) ** 2)) / ss_tot
+        lam = f"{math.exp(coef[0]):.4f}" if coef[0] < 700 else f"e^{coef[0]:.1f}"
+        self.trace.append(f"Step 4: lambda = {lam}, alpha = {coef[1]:.3f}, R^2 = {r2:.6f}")
+        return r2 > self.R2_SMOOTH
+
+    # ------------------------------------------------------------------
+    # Step 5: Structural feature detection
+    # ------------------------------------------------------------------
+    def step5_structural_flags(self):
+        """Return the non-classical features present: nonlinear constraints,
+        arithmetic conditions, nonlocal dependencies (from the generative rule),
+        and irregular sparsity or discontinuities (from the terms)."""
+        flags = [f for f in ("nonlinear", "arithmetic", "nonlocal") if f in self.rule_features]
+        s = self.seq
+        if s and sum(1 for x in s if x == 0) > 0.3 * len(s):
+            flags.append("irregular sparsity")
+        # growth ratios |a_i / a_(i-1)|, computed via logs so huge terms cannot overflow
+        ratios = [math.exp(min(700.0, math.log(abs(s[i])) - math.log(abs(s[i - 1]))))
+                  for i in range(1, len(s)) if s[i - 1] != 0 and s[i] != 0]
+        if len(ratios) > 3 and np.mean(ratios) > 0 and np.std(ratios) > 0.5 * np.mean(ratios):
+            flags.append("discontinuities")
+        return flags
+
+    # ------------------------------------------------------------------
+    # Pipeline (Steps 1-6)
+    # ------------------------------------------------------------------
+    def classify(self, return_reason=False):
+        self.trace = []
+        self.step1_normalize()
+        if not self.seq:
+            out = ("YES", "Step 6: default decision (empty after normalization)")
+        elif self.step2_binomial_structure():
+            out = ("NO", "Step 2: binomial structure")
+        elif self.trace.append("Step 2: no exact binomial-sum match") or self.step3_linear_recurrence():
+            out = ("NO", "Step 3: linear recurrence")
+        elif self.trace.append("Step 3: no verified recurrence found") or self.step4_growth_rate():
+            out = ("NO", "Step 4: smooth exponential growth")
+        else:
+            if not any(t.startswith("Step 4") for t in self.trace):
+                self.trace.append("Step 4: too few nonzero terms for a growth fit")
+            flags = self.step5_structural_flags()
+            if flags:
+                out = ("YES", "Step 5: " + ", ".join(flags))
+            else:
+                out = ("YES", "Step 6: default decision")
+        return out if return_reason else out[0]
+
+
+def parse_terms(text):
+    """Turn pasted text like '1, 1, 2, 3, 5' (commas and/or spaces) into integers."""
+    cleaned = text.replace(",", " ").replace("\u2026", " ").replace("...", " ")
+    return [int(tok) for tok in cleaned.split()]
+
+
 if __name__ == "__main__":
-    print("--- Sequence Novelty Classification Test ---")
-    
-    # Example 1: Known Recurrence (Fibonacci)
-    fib = (0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55)
-    clf_fib = SequenceNoveltyClassifier(fib)
-    print(f"Fibonacci (Known): {clf_fib.classify()}") 
-    
-    # Example 2: Known Polynomial (Squares)
-    squares = (1, 4, 9, 16, 25, 36, 49, 64)
-    clf_sq = SequenceNoveltyClassifier(squares)
-    print(f"Squares (Known): {clf_sq.classify()}")
-    
-    # Example 3: Novel/Irregular Tiling Sequence
-    novel_tiling = (1, 0, 0, 2, 0, 0, 0, 0, 15)
-    clf_novel = SequenceNoveltyClassifier(novel_tiling)
-    print(f"Novel Tiling (Novel): {clf_novel.classify()}")
+    import sys
+
+    print("Sequence Novelty Classifier")
+    print("Paste the terms of a sequence (separated by commas or spaces), then press Enter.")
+    print("Optionally add rule features after a '|', e.g.:  1, 0, 0, 2, 0 | nonlinear")
+    print("Recognized features: nonlinear, arithmetic, nonlocal. Press Enter on an empty line to quit.\n")
+
+    lines = [" ".join(sys.argv[1:])] if len(sys.argv) > 1 else iter(lambda: input("> "), "")
+    for line in lines:
+        terms_part, _, feat_part = line.partition("|")
+        try:
+            terms = parse_terms(terms_part)
+        except ValueError:
+            print("  Could not read the terms. Use whole numbers separated by commas or spaces.\n")
+            continue
+        if not terms:
+            continue
+        feats = {f.strip().lower() for f in feat_part.replace(",", " ").split() if f.strip()}
+        unknown = feats - {"nonlinear", "arithmetic", "nonlocal"}
+        if unknown:
+            print(f"  Ignoring unrecognized feature(s): {', '.join(sorted(unknown))}")
+        if len(terms) < 15:
+            print(f"  Note: {len(terms)} terms given; the paper uses 15 to 30. "
+                  "Steps 2-4 need at least 8 terms and are more reliable with more.")
+        clf = SequenceNoveltyClassifier(terms, feats & {"nonlinear", "arithmetic", "nonlocal"})
+        label, reason = clf.classify(return_reason=True)
+        print(f"  Result: {label}  ({reason})")
+        for step in clf.trace:
+            print(f"    {step}")
+        print()
+
